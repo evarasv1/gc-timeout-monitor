@@ -336,20 +336,20 @@ async function gcPost(path, token, body) {
 // ============================================================
 // ENVÍO DE MENSAJE
 // ============================================================
-function findCustomerCommunicationId(conv) {
-  const customer = (conv.participants || []).find(p =>
-    p.purpose === 'customer' || p.purpose === 'external'
+function findAgentCommunicationId(conv, agentUserId) {
+  const agent = (conv.participants || []).find(p =>
+    p.userId === agentUserId && p.purpose === 'agent'
   );
-  if (!customer) return { error: 'no_customer_participant' };
+  if (!agent) return { error: 'no_agent_participant' };
 
-  const msgs = customer.messages || [];
-  if (msgs.length === 0) return { error: 'customer_has_no_messages' };
+  const msgs = agent.messages || [];
+  if (msgs.length === 0) return { error: 'agent_has_no_messages_communication' };
 
   return { communicationId: msgs[0].id };
 }
 
-async function sendTestMessage(token, conv) {
-  const { communicationId, error } = findCustomerCommunicationId(conv);
+async function sendTestMessage(token, conv, agentUserId) {
+  const { communicationId, error } = findAgentCommunicationId(conv, agentUserId);
   if (error) return { sent: false, reason: error };
 
   const result = await gcPost(
@@ -386,7 +386,7 @@ async function sendTestMessage(token, conv) {
     // Intentar enviar mensaje
     let sendResult;
     try {
-      sendResult = await sendTestMessage(token, conv);
+      sendResult = await sendTestMessage(token, conv, me.id);
     } catch (err) {
       console.error('Error enviando mensaje:', err);
       sendResult = { sent: false, reason: 'error', error: err.message };
