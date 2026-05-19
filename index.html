@@ -34,6 +34,7 @@ const CONFIG = {
   POPUP_TIMEOUT_MS: 60000,
   SILENT_AUTH_TIMEOUT_MS: 8000,
   LOCK_TIMEOUT_MS: 30000,
+  GREETING_TEXT: 'Hola, este es un mensaje de prueba enviado desde la web embebida en el Script.',
 };
 
 const STORAGE_KEY = 'gc_token_bxt';
@@ -84,7 +85,6 @@ function getStoredToken() {
 function saveToken(token, expiresInSec) {
   const exp = Date.now() + (expiresInSec * 1000);
   localStorage.setItem(STORAGE_KEY, JSON.stringify({ token, exp }));
-  // Notifica a iframes hermanos
   try { new BroadcastChannel('gc_auth').postMessage({ type: 'TOKEN_READY' }); } catch {}
 }
 
@@ -274,19 +274,16 @@ async function popupAuth() {
 // FLUJO PRINCIPAL DE AUTH
 // ============================================================
 async function ensureToken() {
-  // 1. Token en localStorage y vigente
   let token = getStoredToken();
   if (token) return token;
 
-  // 2. Otro iframe está autenticando: esperarlo
   if (!acquireLock()) {
     setStatus('Esperando token de otra instancia…');
     try { return await waitForTokenFromSibling(); }
-    catch { /* sigue al paso 3 */ }
+    catch { /* sigue al paso siguiente */ }
   }
 
   try {
-    // 3. Intento silencioso (iframe oculto, prompt=none)
     setStatus('Autenticando en segundo plano…');
     try {
       const data = await silentAuth();
@@ -296,7 +293,6 @@ async function ensureToken() {
       console.warn('Silent auth falló:', err.message);
     }
 
-    // 4. Popup como último recurso
     setStatus('Abriendo ventana de login…');
     const data = await popupAuth();
     saveToken(data.access_token, data.expires_in);
@@ -317,8 +313,57 @@ async function gcGet(path, token) {
     localStorage.removeItem(STORAGE_KEY);
     throw new Error('401 Unauthorized — token revocado');
   }
-  if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`GET ${path} → HTTP ${res.status}`);
   return res.json();
+}
+
+async function gcPost(path, token, body) {
+  const res = await fetch(`https://api.${CONFIG.GC_ENV}${path}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`POST ${path} → ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+// ============================================================
+// ENVÍO DE MENSAJE
+// ============================================================
+function findCustomerCommunicationId(conv) {
+  const customer = (conv.participants || []).find(p =>
+    p.purpose === 'customer' || p.purpose === 'external'
+  );
+  if (!customer) return { error: 'no_customer_participant' };
+
+  const msgs = customer.messages || [];
+  if (msgs.length === 0) return { error: 'customer_has_no_messages' };
+
+  return { communicationId: msgs[0].id };
+}
+
+async function sendTestMessage(token, conv) {
+  const { communicationId, error } = findCustomerCommunicationId(conv);
+  if (error) return { sent: false, reason: error };
+
+  const result = await gcPost(
+    `/api/v2/conversations/messages/${conv.id}/communications/${communicationId}/messages`,
+    token,
+    { textBody: CONFIG.GREETING_TEXT }
+  );
+
+  return {
+    sent: true,
+    text: CONFIG.GREETING_TEXT,
+    communicationId,
+    apiResponse: result,
+  };
 }
 
 // ============================================================
@@ -338,10 +383,20 @@ async function gcGet(path, token) {
       gcGet(`/api/v2/conversations/${conversationId}`, token),
     ]);
 
-    setStatus('Integración funcionando correctamente', 'ok');
+    // Intentar enviar mensaje
+    let sendResult;
+    try {
+      sendResult = await sendTestMessage(token, conv);
+    } catch (err) {
+      console.error('Error enviando mensaje:', err);
+      sendResult = { sent: false, reason: 'error', error: err.message };
+    }
 
-    const agentParticipant = (conv.participants || [])
-      .find(p => p.userId === me.id);
+    if (sendResult.sent) {
+      setStatus('Mensaje enviado correctamente', 'ok');
+    } else {
+      setStatus('Token y lectura OK, pero el envío falló', 'err');
+    }
 
     $('content').innerHTML = `
       <h4>Agente autenticado</h4>
@@ -352,14 +407,14 @@ async function gcGet(path, token) {
       <pre>${escapeHtml(JSON.stringify({
         id: conv.id,
         state: conv.state,
-        recordingState: conv.recordingState,
-        agenteEsParticipante: !!agentParticipant,
         participantes: (conv.participants || []).map(p => ({
           purpose: p.purpose,
           name: p.name,
           userId: p.userId,
         })),
-      }, null, 2))}</pre>`;
+      }, null, 2))}</pre>
+      <h4>Envío de mensaje</h4>
+      <pre>${escapeHtml(JSON.stringify(sendResult, null, 2))}</pre>`;
   } catch (e) {
     setStatus('Error: ' + e.message, 'err');
     console.error(e);
