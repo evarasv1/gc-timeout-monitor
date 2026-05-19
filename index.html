@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>BxT · Timeout WhatsApp</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; padding: 16px; margin: 0; color: #1E293B; }
+  h3 { margin: 0 0 12px; }
+  .status { padding: 10px 12px; border-radius: 6px; margin: 8px 0; font-size: 14px; }
+  .ok   { background: #DCF5EC; color: #035441; }
+  .err  { background: #FDE7E9; color: #8B1A24; }
+  .info { background: #F1F5F9; color: #1E293B; }
+  pre { background: #F8FAFC; padding: 10px; border-radius: 4px; font-size: 12px; overflow: auto; border: 1px solid #E2E8F0; }
+  h4 { margin: 16px 0 6px; font-size: 13px; color: #475569; text-transform: uppercase; letter-spacing: 0.5px; }
+</style>
+</head>
+<body>
+<h3>Prueba de integración · BxT</h3>
+<div id="status" class="status info">Inicializando…</div>
+<div id="content"></div>
+
+<script>
+// ============================================================
+// CONFIGURACIÓN
+// ============================================================
+const CONFIG = {
+  CLIENT_ID:    'PEGAR_AQUI_TU_CLIENT_ID',
+  REDIRECT_URI: 'https://TU-USUARIO.github.io/REPO/callback.html',
+  GC_ENV:       'mypurecloud.com',        // o 'usw2.pure.cloud', 'sae1.pure.cloud', etc.
+  SCOPES:       'users conversations',
+  ORG_NAME:     '',                        // opcional: nombre corto de la org BCP en Genesys
+  PROVIDER:     '',                        // opcional: 'okta', 'adfs', 'onelogin'. Entra ID usa default
+  TOKEN_REFRESH_BUFFER_SEC: 300,           // refrescar 5 min antes de expirar
+  POPUP_TIMEOUT_MS: 60000,
+  SILENT_AUTH_TIMEOUT_MS: 8000,
+  LOCK_TIMEOUT_MS: 30000,
+};
+
+const STORAGE_KEY = 'gc_token_bxt';
+const LOCK_KEY    = 'gc_auth_lock_bxt';
+
+// ============================================================
+// UTILIDADES UI
+// ============================================================
+const $ = id => document.getElementById(id);
+const setStatus = (msg, cls='info') => {
+  $('status').textContent = msg;
+  $('status').className = 'status ' + cls;
+};
+
+// ============================================================
+// PARSEAR CONVERSATION ID
+// ============================================================
+const conversationId = new URLSearchParams(location.search).get('conversationId');
+
+// ============================================================
+// PKCE HELPERS
+// ============================================================
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+
+const randomStr = (n = 64) => {
+  const a = new Uint8Array(n);
+  crypto.getRandomValues(a);
+  return b64url(a).slice(0, n);
+};
+
+const sha256b64 = async s =>
+  b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)));
+
+// ============================================================
+// TOKEN STORAGE
+// ============================================================
+function getStoredToken() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const { token, exp } = JSON.parse(raw);
+    const bufferMs = CONFIG.TOKEN_REFRESH_BUFFER_SEC * 1000;
+    return (Date.now() + bufferMs) < exp ? token : null;
+  } catch { return null; }
+}
+
+function saveToken(token, expiresInSec) {
+  const exp = Date.now() + (expiresInSec * 1000);
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ token, exp }));
+  // Notifica a iframes hermanos
+  try { new BroadcastChannel('gc_auth').postMessage({ type: 'TOKEN_READY' }); } catch {}
+}
+
+// ============================================================
+// LOCK PARA EVITAR POPUPS MÚLTIPLES
+// ============================================================
+function acquireLock() {
+  const existing = localStorage.getItem(LOCK_KEY);
+  if (existing) {
+    const { ts } = JSON.parse(existing);
+    if (Date.now() - ts < CONFIG.LOCK_TIMEOUT_MS) return false;
+  }
+  localStorage.setItem(LOCK_KEY, JSON.stringify({ ts: Date.now() }));
+  return true;
+}
+
+function releaseLock() {
+  localStorage.removeItem(LOCK_KEY);
+}
+
+function waitForTokenFromSibling() {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Timeout esperando token de iframe hermano'));
+    }, CONFIG.LOCK_TIMEOUT_MS);
+
+    const onStorage = e => {
+      if (e.key === STORAGE_KEY && e.newValue) {
+        cleanup();
+        const t = getStoredToken();
+        t ? resolve(t) : reject(new Error('Token recibido inválido'));
+      }
+    };
+
+    let channel;
+    try {
+      channel = new BroadcastChannel('gc_auth');
+      channel.onmessage = e => {
+        if (e.data?.type === 'TOKEN_READY') {
+          cleanup();
+          const t = getStoredToken();
+          t ? resolve(t) : reject(new Error('Token broadcast inválido'));
+        }
+      };
+    } catch {}
+
+    function cleanup() {
+      clearTimeout(timeout);
+      window.removeEventListener('storage', onStorage);
+      if (channel) channel.close();
+    }
+    window.addEventListener('storage', onStorage);
+  });
+}
+
+// ============================================================
+// CONSTRUIR URL DE AUTORIZACIÓN
+// ============================================================
+function buildAuthorizeUrl(challenge, state, silent = false) {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: CONFIG.CLIENT_ID,
+    redirect_uri: CONFIG.REDIRECT_URI,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state,
+    scope: CONFIG.SCOPES,
+  });
+  if (CONFIG.ORG_NAME) params.set('org', CONFIG.ORG_NAME);
+  if (CONFIG.PROVIDER) params.set('provider', CONFIG.PROVIDER);
+  if (silent) params.set('prompt', 'none');
+  return `https://login.${CONFIG.GC_ENV}/oauth/authorize?${params}`;
+}
+
+// ============================================================
+// INTERCAMBIO CODE → TOKEN
+// ============================================================
+async function exchangeCodeForToken(code, verifier) {
+  const res = await fetch(`https://login.${CONFIG.GC_ENV}/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: CONFIG.REDIRECT_URI,
+      client_id: CONFIG.CLIENT_ID,
+      code_verifier: verifier,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Token exchange ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+// ============================================================
+// INTENTO SILENCIOSO (iframe oculto con prompt=none)
+// ============================================================
+async function silentAuth() {
+  const verifier = randomStr(64);
+  const challenge = await sha256b64(verifier);
+  const state = randomStr(16);
+  const url = buildAuthorizeUrl(challenge, state, true);
+
+  return new Promise((resolve, reject) => {
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = url;
+    document.body.appendChild(iframe);
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('silent_timeout'));
+    }, CONFIG.SILENT_AUTH_TIMEOUT_MS);
+
+    const onMessage = async e => {
+      if (e.origin !== new URL(CONFIG.REDIRECT_URI).origin) return;
+      if (e.data?.type !== 'gc_auth') return;
+      cleanup();
+      if (e.data.error) return reject(new Error(e.data.error));
+      if (e.data.state !== state) return reject(new Error('state_mismatch'));
+      try {
+        const data = await exchangeCodeForToken(e.data.code, verifier);
+        resolve(data);
+      } catch (err) { reject(err); }
+    };
+
+    function cleanup() {
+      clearTimeout(timeout);
+      window.removeEventListener('message', onMessage);
+      iframe.remove();
+    }
+    window.addEventListener('message', onMessage);
+  });
+}
+
+// ============================================================
+// POPUP AUTH (fallback)
+// ============================================================
+async function popupAuth() {
+  const verifier = randomStr(64);
+  const challenge = await sha256b64(verifier);
+  const state = randomStr(16);
+  const url = buildAuthorizeUrl(challenge, state, false);
+
+  const popup = window.open(url, 'gc_auth', 'width=500,height=700,menubar=no,toolbar=no');
+  if (!popup) throw new Error('Popup bloqueado por el navegador. Habilita popups para este sitio.');
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Timeout esperando login en popup'));
+    }, CONFIG.POPUP_TIMEOUT_MS);
+
+    const popupWatcher = setInterval(() => {
+      if (popup.closed) {
+        cleanup();
+        reject(new Error('Popup cerrado antes de completar login'));
+      }
+    }, 500);
+
+    const onMessage = async e => {
+      if (e.origin !== new URL(CONFIG.REDIRECT_URI).origin) return;
+      if (e.data?.type !== 'gc_auth') return;
+      cleanup();
+      if (e.data.error) return reject(new Error(e.data.error));
+      if (e.data.state !== state) return reject(new Error('state_mismatch'));
+      try {
+        const data = await exchangeCodeForToken(e.data.code, verifier);
+        resolve(data);
+      } catch (err) { reject(err); }
+    };
+
+    function cleanup() {
+      clearTimeout(timeout);
+      clearInterval(popupWatcher);
+      window.removeEventListener('message', onMessage);
+      if (!popup.closed) popup.close();
+    }
+    window.addEventListener('message', onMessage);
+  });
+}
+
+// ============================================================
+// FLUJO PRINCIPAL DE AUTH
+// ============================================================
+async function ensureToken() {
+  // 1. Token en localStorage y vigente
+  let token = getStoredToken();
+  if (token) return token;
+
+  // 2. Otro iframe está autenticando: esperarlo
+  if (!acquireLock()) {
+    setStatus('Esperando token de otra instancia…');
+    try { return await waitForTokenFromSibling(); }
+    catch { /* sigue al paso 3 */ }
+  }
+
+  try {
+    // 3. Intento silencioso (iframe oculto, prompt=none)
+    setStatus('Autenticando en segundo plano…');
+    try {
+      const data = await silentAuth();
+      saveToken(data.access_token, data.expires_in);
+      return data.access_token;
+    } catch (err) {
+      console.warn('Silent auth falló:', err.message);
+    }
+
+    // 4. Popup como último recurso
+    setStatus('Abriendo ventana de login…');
+    const data = await popupAuth();
+    saveToken(data.access_token, data.expires_in);
+    return data.access_token;
+  } finally {
+    releaseLock();
+  }
+}
+
+// ============================================================
+// LLAMADAS A LA API
+// ============================================================
+async function gcGet(path, token) {
+  const res = await fetch(`https://api.${CONFIG.GC_ENV}${path}`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  if (res.status === 401) {
+    localStorage.removeItem(STORAGE_KEY);
+    throw new Error('401 Unauthorized — token revocado');
+  }
+  if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
+  return res.json();
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+(async () => {
+  try {
+    if (!conversationId) {
+      return setStatus('Falta conversationId en la URL del Web Page Source', 'err');
+    }
+
+    const token = await ensureToken();
+    setStatus('Token obtenido, consultando APIs…');
+
+    const [me, conv] = await Promise.all([
+      gcGet('/api/v2/users/me', token),
+      gcGet(`/api/v2/conversations/${conversationId}`, token),
+    ]);
+
+    setStatus('Integración funcionando correctamente', 'ok');
+
+    const agentParticipant = (conv.participants || [])
+      .find(p => p.userId === me.id);
+
+    $('content').innerHTML = `
+      <h4>Agente autenticado</h4>
+      <pre>${escapeHtml(JSON.stringify({
+        id: me.id, name: me.name, email: me.email,
+      }, null, 2))}</pre>
+      <h4>Conversación</h4>
+      <pre>${escapeHtml(JSON.stringify({
+        id: conv.id,
+        state: conv.state,
+        recordingState: conv.recordingState,
+        agenteEsParticipante: !!agentParticipant,
+        participantes: (conv.participants || []).map(p => ({
+          purpose: p.purpose,
+          name: p.name,
+          userId: p.userId,
+        })),
+      }, null, 2))}</pre>`;
+  } catch (e) {
+    setStatus('Error: ' + e.message, 'err');
+    console.error(e);
+  }
+})();
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+</script>
+</body>
+</html>
