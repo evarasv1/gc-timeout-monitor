@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Autenticación · BxT</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; padding: 24px; color: #475569; text-align: center; }
+</style>
+</head>
+<body>
+<p>Procesando autenticación…</p>
+
+<script>
+(function () {
+  const params = new URLSearchParams(location.search);
+  const payload = {
+    type:  'gc_auth',
+    code:  params.get('code'),
+    state: params.get('state'),
+    error: params.get('error') || params.get('error_description'),
+  };
+
+  // Caso 1: estamos en un popup (window.opener existe)
+  if (window.opener && !window.opener.closed) {
+    try {
+      window.opener.postMessage(payload, window.location.origin);
+    } catch (e) {
+      document.body.innerHTML = '<p>Error notificando a la app: ' + e.message + '</p>';
+      return;
+    }
+    window.close();
+    return;
+  }
+
+  // Caso 2: estamos en un iframe oculto (silent auth)
+  if (window.parent && window.parent !== window) {
+    try {
+      window.parent.postMessage(payload, window.location.origin);
+    } catch (e) {
+      // El parent en silent auth puede estar en otro origen; intenta wildcard
+      window.parent.postMessage(payload, '*');
+    }
+    return;
+  }
+
+  // Caso 3: alguien abrió esta URL directo (no debería pasar)
+  document.body.innerHTML = '<p>Esta página solo funciona como callback de autenticación.</p>';
+})();
+</script>
+</body>
+</html>
