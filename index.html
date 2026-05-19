@@ -26,11 +26,11 @@
 const CONFIG = {
   CLIENT_ID:    'PEGAR_AQUI_TU_CLIENT_ID',
   REDIRECT_URI: 'https://TU-USUARIO.github.io/REPO/callback.html',
-  GC_ENV:       'mypurecloud.com',        // o 'usw2.pure.cloud', 'sae1.pure.cloud', etc.
-  SCOPES:       'users conversations',
-  ORG_NAME:     '',                        // opcional: nombre corto de la org BCP en Genesys
-  PROVIDER:     '',                        // opcional: 'okta', 'adfs', 'onelogin'. Entra ID usa default
-  TOKEN_REFRESH_BUFFER_SEC: 300,           // refrescar 5 min antes de expirar
+  GC_ENV:       'mypurecloud.com',       
+  SCOPES:       'users:readonly conversations',
+  ORG_NAME:     '',                        
+  PROVIDER:     '',                       
+  TOKEN_REFRESH_BUFFER_SEC: 300,           
   POPUP_TIMEOUT_MS: 60000,
   SILENT_AUTH_TIMEOUT_MS: 8000,
   LOCK_TIMEOUT_MS: 30000,
